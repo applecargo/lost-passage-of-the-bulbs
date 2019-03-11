@@ -17,24 +17,50 @@
 //
 // afterwards, more changes applied for
 //    (1) re-activate SPIFFSEditor
-//    (2) use a captive portal (adapting --> https://github.com/espressif/arduino-esp32/tree/master/libraries/DNSServer)
+//    (2) use a captive portal
 //
 
-#include <WiFi.h>
-#include <ESPmDNS.h>
-#include <ArduinoOTA.h>
-#include <FS.h>
-#include <AsyncTCP.h>
-#include <SPIFFS.h>
-#include <SPIFFSEditor.h>
-//#include <AsyncWebSocket.h>
-#include <ESPAsyncWebServer.h>
+/***************************************/
+/*  CONFIGURATIONS                     */
+/***************************************/
 
-// SKETCH BEGIN
+// identifications & credentials
+const char* hostName = "WIFI-ZINE";
+const char* http_username = "admin";
+const char* http_password = "admin";
+
+/***************************************/
+/*  ALL HEADERS and GLOBAL VARIABLES   */
+/***************************************/
+
+//over-the-air firmware updater
+#include <ArduinoOTA.h>
+
+//file system
+#include <FS.h>
+#include <SPIFFS.h>
+
+//wifi / tcp
+#include <WiFi.h>
+#include <AsyncTCP.h>
+
+//dns server
+#include <DNSServer.h>
+DNSServer dnsServer;
+
+// captive portal -> a self-assigned ip
+IPAddress apIP(192, 168, 4, 1);
+
+//web server
+#include <ESPAsyncWebServer.h> // <-- this includes, also, "AsyncWebSocket.h" and "AsyncEventSource.h"
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 AsyncEventSource events("/events");
 
+//a web-based file-editor (upload/create/modify/delete files)
+#include <SPIFFSEditor.h>
+
+//a generic(monitoring) websocket events' handler (==template)
 void onWsEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len){
   if(type == WS_EVT_CONNECT) {
     Serial.printf("ws[%s][%u] connect\n", server->url(), client->id());
@@ -107,35 +133,22 @@ void onWsEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventT
   }
 }
 
-
-const char* ssid = "****";
-const char* password = "********";
-const char * hostName = "esp-async";
-const char* http_username = "admin";
-const char* http_password = "admin";
-
 void setup(){
+  //serial monitoring
   Serial.begin(115200);
   Serial.setDebugOutput(true);
   delay(10);
   Serial.printf("START\n");
 
-  WiFi.mode(WIFI_AP_STA);
+  //wifi
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
   WiFi.softAP(hostName);
-  WiFi.begin(ssid, password);
   WiFi.setHostname(hostName);
+  //my ip
+  Serial.print("IP address:"); Serial.println(WiFi.localIP());
 
-  if (WiFi.waitForConnectResult() != WL_CONNECTED) {
-    Serial.printf("STA: Failed!\n");
-    WiFi.disconnect(false);
-    delay(1000);
-    WiFi.begin(ssid, password);
-  }
-
-  Serial.print ( "IP address: " );
-  Serial.println ( WiFi.localIP() );
-
-  //Send OTA events to the browser
+  //arduino-ota <-> browser
   ArduinoOTA.onStart([]() {
     events.send("Update Start", "ota");
   });
@@ -157,26 +170,34 @@ void setup(){
   ArduinoOTA.setHostname(hostName);
   ArduinoOTA.begin();
 
-  MDNS.addService("http","tcp",80);
-
+  //file system
   SPIFFS.begin();
 
+  //dns service (captive portal)
+  dnsServer.start(53, "*", apIP); // reply with provided IP(apIP) to all("*") DNS request
+
+  //websocket (a generic websocket events handler)
   ws.onEvent(onWsEvent);
   server.addHandler(&ws);
 
+  //event source (an example 'hello')
   events.onConnect([](AsyncEventSourceClient *client){
     client->send("hello!",NULL,millis(),1000);
   });
   server.addHandler(&events);
 
+  //web-based file-editor handler
   server.addHandler(new SPIFFSEditor(SPIFFS, http_username, http_password));
 
+  //route "/heap" -> reports amount of free heap.
   server.on("/heap", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send(200, "text/plain", String(ESP.getFreeHeap()));
   });
 
+  //serve-root
   server.serveStatic("/", SPIFFS, "/").setDefaultFile("index.htm");
 
+  //404 handler
   server.onNotFound([](AsyncWebServerRequest *request){
     Serial.printf("NOT_FOUND: ");
     if(request->method() == HTTP_GET)
@@ -221,8 +242,23 @@ void setup(){
       }
     }
 
-    request->send(404);
+    // if(request->method() == HTTP_GET)
+    // {
+    request->redirect(String("http://") + apIP.toString() + "/");
+    // instead of giving 404 to clients, redirect them to 'apIP'.
+    //     --> https://pastebin.com/gBHU34Z9 (communication log..)
+
+    // AsyncWebServerResponse *response = request->beginResponse(302, "text/plain", "");
+    // response->addHeader("Location", String("http://") + apIP.toString() + "/");
+    // request->send(response);
+    // }
+    // else
+    // {
+    //   request->send(404);
+    // }
   });
+
+  //file upload monitoring
   server.onFileUpload([](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final){
     if(!index)
       Serial.printf("UploadStart: %s\n", filename.c_str());
@@ -230,6 +266,8 @@ void setup(){
     if(final)
       Serial.printf("UploadEnd: %s (%u)\n", filename.c_str(), index+len);
   });
+
+  //request body monitoring
   server.onRequestBody([](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
     if(!index)
       Serial.printf("BodyStart: %u\n", total);
@@ -237,9 +275,13 @@ void setup(){
     if(index + len == total)
       Serial.printf("BodyEnd: %u\n", total);
   });
+
+  //start the web service
   server.begin();
 }
 
+// handle OTA && DNS
 void loop(){
   ArduinoOTA.handle();
+  dnsServer.processNextRequest();
 }
